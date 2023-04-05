@@ -18,8 +18,10 @@ import (
 	"github.com/helmfile/helmfile/pkg/runtime"
 )
 
-var logger *zap.SugaredLogger
-var globalUsage = "Declaratively deploy your Kubernetes manifests, Kustomize configs, and Charts as Helm releases in one shot\n" + runtime.Info()
+var (
+	logger      *zap.SugaredLogger
+	globalUsage = "Declaratively deploy your Kubernetes manifests, Kustomize configs, and Charts as Helm releases in one shot\n" + runtime.Info()
+)
 
 func toCLIError(g *config.GlobalImpl, err error) error {
 	if err != nil {
@@ -96,6 +98,7 @@ func NewRootCmd(globalConfig *config.GlobalOptions) (*cobra.Command, error) {
 		NewTestCmd(globalImpl),
 		NewTemplateCmd(globalImpl),
 		NewSyncCmd(globalImpl),
+		NewDagCmd(globalImpl),
 		NewDiffCmd(globalImpl),
 		NewStatusCmd(globalImpl),
 		extension.NewVersionCobraCmd(

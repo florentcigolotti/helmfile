@@ -142,13 +142,85 @@ func (a *App) DeprecatedSyncCharts(c DeprecatedChartsConfigProvider) error {
 		}, func() {
 			errs = run.DeprecatedSyncCharts(c)
 		})
-
 		if err != nil {
 			errs = append(errs, err)
 		}
 
 		return
 	}, c.IncludeTransitiveNeeds(), SetFilter(true))
+}
+
+func (a *App) Dag(c DagConfigProvider) error {
+	var allDiffDetectedErrs []error
+
+	var affectedAny bool
+
+	err := a.ForEachState(func(run *Run) (bool, []error) {
+		var criticalErrs []error
+
+		var msg *string
+
+		var matched, affected bool
+
+		var errs []error
+
+		includeCRDs := !c.SkipCRDs()
+
+		prepErr := run.withPreparedCharts("diff", state.ChartPrepareOptions{
+			SkipRepos:              c.SkipDeps(),
+			SkipDeps:               c.SkipDeps(),
+			IncludeCRDs:            &includeCRDs,
+			Validate:               c.Validate(),
+			Concurrency:            c.Concurrency(),
+			IncludeTransitiveNeeds: c.IncludeNeeds(),
+		}, func() {
+			msg, matched, affected, errs = a.dag(run, c)
+		})
+
+		if msg != nil {
+			a.Logger.Info(*msg)
+		}
+
+		if prepErr != nil {
+			errs = append(errs, prepErr)
+		}
+
+		affectedAny = affectedAny || affected
+
+		for i := range errs {
+			switch e := errs[i].(type) {
+			case *state.ReleaseError:
+				switch e.Code {
+				case 2:
+					// See https://github.com/roboll/helmfile/issues/874
+					allDiffDetectedErrs = append(allDiffDetectedErrs, e)
+				default:
+					criticalErrs = append(criticalErrs, e)
+				}
+			default:
+				criticalErrs = append(criticalErrs, e)
+			}
+		}
+
+		return matched, criticalErrs
+	}, c.IncludeTransitiveNeeds())
+	if err != nil {
+		return err
+	}
+
+	if c.DetailedExitcode() && (len(allDiffDetectedErrs) > 0 || affectedAny) {
+		// We take the first release error w/ exit status 2 (although all the defered errs should have exit status 2)
+		// to just let helmfile itself to exit with 2
+		// See https://github.com/roboll/helmfile/issues/749
+		code := 2
+		e := &Error{
+			msg:  "Identified at least one change",
+			code: &code,
+		}
+		return e
+	}
+
+	return nil
 }
 
 func (a *App) Diff(c DiffConfigProvider) error {
@@ -205,7 +277,6 @@ func (a *App) Diff(c DiffConfigProvider) error {
 
 		return matched, criticalErrs
 	}, c.IncludeTransitiveNeeds())
-
 	if err != nil {
 		return err
 	}
@@ -325,7 +396,6 @@ func (a *App) Lint(c LintConfigProvider) error {
 
 		return
 	}, c.IncludeTransitiveNeeds())
-
 	if err != nil {
 		return err
 	}
@@ -420,7 +490,6 @@ func (a *App) Apply(c ApplyConfigProvider) error {
 
 		return
 	}, c.IncludeTransitiveNeeds(), opts...)
-
 	if err != nil {
 		return err
 	}
@@ -443,7 +512,6 @@ func (a *App) Status(c StatusesConfigProvider) error {
 		}, func() {
 			ok, errs = a.status(run, c)
 		})
-
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -463,7 +531,6 @@ func (a *App) Delete(c DeleteConfigProvider) error {
 			}, func() {
 				ok, errs = a.delete(run, c.Purge(), c)
 			})
-
 			if err != nil {
 				errs = append(errs, err)
 			}
@@ -509,7 +576,6 @@ func (a *App) Test(c TestConfigProvider) error {
 		}, func() {
 			errs = a.test(run, c)
 		})
-
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -562,7 +628,6 @@ func (a *App) PrintState(c StateConfigProvider) error {
 
 			errs = []error{}
 		})
-
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -602,7 +667,6 @@ func (a *App) ListReleases(c ListConfigProvider) error {
 
 		return
 	}, false, SetFilter(true))
-
 	if err != nil {
 		return err
 	}
@@ -904,7 +968,6 @@ func (a *App) visitStates(fileOrDir string, defOpts LoadOpts, converge func(*sta
 
 		return nil
 	})
-
 	if err != nil {
 		return err
 	}
@@ -1559,6 +1622,17 @@ Do you really want to delete?
 	return true, errs
 }
 
+func (a *App) dag(r *Run, c DagConfigProvider) (*string, bool, bool, []error) {
+	var (
+		infoMsg          *string
+		updated, deleted map[string]state.ReleaseSpec
+	)
+
+	ok, _ := a.getDag(r, c)
+
+	return infoMsg, ok, len(deleted) > 0 || len(updated) > 0, nil
+}
+
 func (a *App) diff(r *Run, c DiffConfigProvider) (*string, bool, bool, []error) {
 	var (
 		infoMsg          *string
@@ -1885,6 +1959,30 @@ func (a *App) template(r *Run, c TemplateConfigProvider) (bool, []error) {
 		}
 		return st.TemplateReleases(helm, c.OutputDir(), c.Values(), args, c.Concurrency(), c.Validate(), opts)
 	})
+}
+
+func (a *App) getDag(r *Run, c DAGConfig) (bool, error) {
+	st := r.state
+
+	selectedReleases, deduplicated, err := a.getSelectedReleases(r, false)
+	if err != nil {
+		return false, err
+	}
+	if len(selectedReleases) == 0 {
+		return false, nil
+	}
+
+	// This is required when you're trying to deduplicate releases by the selector.
+	// Without this, `PlanReleases` conflates duplicates and return both in `batches`,
+	// even if we provided `SelectedReleases: selectedReleases`.
+	// See https://github.com/roboll/helmfile/issues/1818 for more context.
+	st.Releases = deduplicated
+	_, err = st.GetDag(state.PlanOptions{Reverse: false, SelectedReleases: selectedReleases, IncludeNeeds: true, IncludeTransitiveNeeds: true, SkipNeeds: c.SkipNeeds()})
+	if err != nil {
+		return false, err
+	}
+
+	return true, err
 }
 
 func (a *App) withNeeds(r *Run, c DAGConfig, includeDisabled bool, f func(*state.HelmState) []error) (bool, []error) {

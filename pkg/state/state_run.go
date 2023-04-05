@@ -3,6 +3,8 @@ package state
 import (
 	"errors"
 	"fmt"
+	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -42,13 +44,15 @@ func (st *HelmState) scatterGather(concurrency int, items int, produceInputs fun
 }
 
 func (st *HelmState) scatterGatherReleases(helm helmexec.Interface, concurrency int,
-	do func(ReleaseSpec, int) error) []error {
+	do func(ReleaseSpec, int) error,
+) []error {
 	return st.iterateOnReleases(helm, concurrency, st.Releases, do)
 }
 
 // nolint: unparam
 func (st *HelmState) iterateOnReleases(helm helmexec.Interface, concurrency int, inputs []ReleaseSpec,
-	do func(ReleaseSpec, int) error) []error {
+	do func(ReleaseSpec, int) error,
+) []error {
 	var errs []error
 
 	inputsSize := len(inputs)
@@ -96,6 +100,49 @@ type PlanOptions struct {
 	IncludeTransitiveNeeds bool
 	SkipNeeds              bool
 	SelectedReleases       []ReleaseSpec
+}
+
+func (st *HelmState) GetDag(opts PlanOptions) (*dag.DAG, error) {
+	releases, err := st.SelectReleases(opts.IncludeTransitiveNeeds)
+	if err != nil {
+		return nil, err
+	}
+	idToReleases := map[string][]Release{}
+	idToIndex := map[string]int{}
+
+	d := dag.New()
+	for i, r := range releases {
+		id := ReleaseToID(&r.ReleaseSpec)
+
+		idToReleases[id] = append(idToReleases[id], r)
+		idToIndex[id] = i
+
+		var needs []string
+		for i := 0; i < len(r.Needs); i++ {
+			n := r.Needs[i]
+			needs = append(needs, n)
+		}
+		d.Add(id, dag.Dependencies(needs))
+	}
+
+	var selectedReleaseIDs []string
+
+	for _, r := range opts.SelectedReleases {
+		release := r
+		id := ReleaseToID(&release)
+		selectedReleaseIDs = append(selectedReleaseIDs, id)
+	}
+
+	_, err = d.Plan(dag.SortOptions{
+		Only:                selectedReleaseIDs,
+		WithDependencies:    opts.IncludeNeeds,
+		WithoutDependencies: opts.SkipNeeds,
+	})
+	if err := d.WriteDotTo(os.Stdout); err != nil {
+		log.Fatal(err)
+	}
+
+	return d, nil
 }
 
 func (st *HelmState) PlanReleases(opts PlanOptions) ([][]Release, error) {

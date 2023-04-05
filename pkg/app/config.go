@@ -106,6 +106,33 @@ type SyncConfigProvider interface {
 	valuesControlMode
 }
 
+type DagConfigProvider interface {
+	Args() string
+	PostRenderer() string
+
+	Values() []string
+	Set() []string
+	Validate() bool
+	SkipCRDs() bool
+	SkipDeps() bool
+
+	IncludeTests() bool
+
+	Suppress() []string
+	SuppressSecrets() bool
+	ShowSecrets() bool
+	NoHooks() bool
+
+	DAGConfig
+
+	DetailedExitcode() bool
+	Color() bool
+	NoColor() bool
+	Context() int
+
+	concurrencyConfig
+	valuesControlMode
+}
 type DiffConfigProvider interface {
 	Args() string
 	PostRenderer() string
